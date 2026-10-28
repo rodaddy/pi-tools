@@ -29,7 +29,7 @@ _SECRETS_PATTERN='\.(env|pem|key|p12|pfx|jks|keystore)$|credentials|\.secret|id_
 _CHILD_PIDS=()
 _cleanup_children() {
   for pid in ${_CHILD_PIDS[@]+"${_CHILD_PIDS[@]}"}; do
-    kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true # already-exited child must not trip set -e in the EXIT trap
   done
   wait 2>/dev/null
 }

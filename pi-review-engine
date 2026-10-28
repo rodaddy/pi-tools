@@ -134,7 +134,7 @@ _run_omp_review() {
   while kill -0 "$PID" 2>/dev/null; do
     if [[ "$ELAPSED" -ge "$PI_REVIEW_TIMEOUT" ]]; then
       kill -- -"$PID" 2>/dev/null || kill "$PID" 2>/dev/null
-      wait "$PID" 2>/dev/null
+      wait "$PID" 2>/dev/null || true
       echo "TIMEOUT: review exceeded ${PI_REVIEW_TIMEOUT}s" >> "$ERRFILE"
       rm -rf "$INSTANCE_DIR"
       return 1
@@ -143,8 +143,8 @@ _run_omp_review() {
     ELAPSED=$((ELAPSED + 1))
   done
 
-  wait "$PID" 2>/dev/null
-  local RC=$?
+  local RC=0
+  wait "$PID" 2>/dev/null || RC=$? # callers run under set -e; keep the cleanup below reachable
   rm -rf "$INSTANCE_DIR"
   return $RC
 }
@@ -187,7 +187,7 @@ _run_pi_review() {
   while kill -0 "$PID" 2>/dev/null; do
     if [[ "$ELAPSED" -ge "$PI_REVIEW_TIMEOUT" ]]; then
       kill -- -"$PID" 2>/dev/null || kill "$PID" 2>/dev/null
-      wait "$PID" 2>/dev/null
+      wait "$PID" 2>/dev/null || true
       echo "TIMEOUT: review exceeded ${PI_REVIEW_TIMEOUT}s" >> "$ERRFILE"
       rm -rf "$INSTANCE_DIR"
       return 1
@@ -196,8 +196,8 @@ _run_pi_review() {
     ELAPSED=$((ELAPSED + 1))
   done
 
-  wait "$PID" 2>/dev/null
-  local RC=$?
+  local RC=0
+  wait "$PID" 2>/dev/null || RC=$? # callers run under set -e; keep the cleanup below reachable
   rm -rf "$INSTANCE_DIR"
   return $RC
 }
