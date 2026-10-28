@@ -148,7 +148,7 @@ setup/install.sh      setup script
 
 ## Project status
 
-Working tool at v2.0. The code last changed in May 2026. There is no automated test suite yet; the grader
+Working tool at v2.0. The code last changed in October 2026 (a fix so clean runs exit 0 and failed reviewers clean up their temp folders). There is no automated test suite yet; the grader
 (`pi-grades`) is the obvious first candidate.
 
 ## How it was built
