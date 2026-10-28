@@ -1,0 +1,216 @@
+#!/bin/bash
+# pi-review-engine -- Review routing engine (omp vs pi fallback)
+# Source this file to get run_review() and related functions.
+# Requires: pi-harness-config already sourced (for PI_HARNESS_MODEL_* vars)
+
+# Default PI_PROMPTS_DIR to the prompts dir relative to this file
+PI_PROMPTS_DIR="${PI_PROMPTS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/prompts" 2>/dev/null && pwd -P)}"
+
+# Valid personas (allowlist for path traversal prevention)
+_VALID_PERSONAS="correctness adversarial security quality verifier"
+
+_validate_persona() {
+  local PERSONA="$1"
+  for p in $_VALID_PERSONAS; do
+    [[ "$p" == "$PERSONA" ]] && return 0
+  done
+  return 1
+}
+
+# Persona focus areas appended to omp's reviewer prompt
+_persona_focus() {
+  case "$1" in
+    correctness)
+      cat <<'FOCUS'
+REVIEW FOCUS: Correctness
+Prioritize: logic errors, off-by-one mistakes, null/undefined hazards, race conditions, missing edge cases, incorrect assumptions. De-prioritize style and documentation issues.
+FOCUS
+      ;;
+    adversarial)
+      cat <<'FOCUS'
+REVIEW FOCUS: Adversarial / Robustness
+Think like an attacker or stressed production system. Prioritize: input validation gaps (empty, null, huge, malformed input), error handling holes (network down, DB slow, disk full), resource exhaustion, state corruption, concurrency hazards. De-prioritize happy-path correctness.
+FOCUS
+      ;;
+    security)
+      cat <<'FOCUS'
+REVIEW FOCUS: Security (OWASP Top 10 / CWE)
+Prioritize: injection flaws (SQL, command, XSS, template), authentication and authorization gaps, secrets exposure, unsafe deserialization, path traversal, SSRF, insecure defaults. De-prioritize non-security code quality.
+FOCUS
+      ;;
+    quality)
+      cat <<'FOCUS'
+REVIEW FOCUS: Code Quality / Maintainability
+Prioritize: dead code, unused imports, single responsibility violations, poor naming, duplication, unnecessary complexity, testability problems. De-prioritize correctness bugs (other reviewers handle those).
+FOCUS
+      ;;
+    verifier)
+      cat <<'FOCUS'
+REVIEW FOCUS: Intent Verification
+You did NOT write this code. Verify: does implementation match stated intent? Are there undocumented side effects? Is stated functionality actually implemented? Is there scope creep beyond what was described?
+FOCUS
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+_has_omp() {
+  command -v omp >/dev/null 2>&1
+}
+
+# Review timeout in seconds (override with PI_REVIEW_TIMEOUT env var)
+PI_REVIEW_TIMEOUT="${PI_REVIEW_TIMEOUT:-300}"
+
+# run_review <input_file> <provider> <model> <persona> <outfile> [<errfile>]
+# input_file: path to file containing the diff or full source to review
+# provider/model: e.g. "litellm" "opus-nocache"
+# persona: correctness|adversarial|security|quality|verifier
+# outfile: where to write review output
+# errfile: where to write errors (defaults to outfile.err)
+# Respects PI_REVIEW_PROMPT env var for the review instruction.
+run_review() {
+  local DIFF_FILE="$1"
+  local PROVIDER="$2"
+  local MODEL="$3"
+  local PERSONA="$4"
+  local OUTFILE="$5"
+  local ERRFILE="${6:-${5}.err}"
+  local REVIEW_PROMPT="${PI_REVIEW_PROMPT:-Review this diff.}"
+
+  if ! _validate_persona "$PERSONA"; then
+    echo "Error: unknown persona '$PERSONA'. Valid: $_VALID_PERSONAS" > "$ERRFILE"
+    return 1
+  fi
+
+  if _has_omp; then
+    _run_omp_review "$DIFF_FILE" "$PROVIDER" "$MODEL" "$PERSONA" "$OUTFILE" "$ERRFILE" "$REVIEW_PROMPT"
+  else
+    _run_pi_review "$DIFF_FILE" "$PROVIDER" "$MODEL" "$PERSONA" "$OUTFILE" "$ERRFILE" "$REVIEW_PROMPT"
+  fi
+}
+
+_run_omp_review() {
+  local DIFF_FILE="$1" PROVIDER="$2" MODEL="$3" PERSONA="$4" OUTFILE="$5" ERRFILE="$6" REVIEW_PROMPT="$7"
+  local REVIEWER_PROMPT="${OMP_REVIEWER_PROMPT:-${HOME}/.omp/agent/agents/reviewer.md}"
+
+  if [[ ! -f "$REVIEWER_PROMPT" ]]; then
+    echo "WARN: omp reviewer prompt not found at $REVIEWER_PROMPT, falling back to pi" >&2
+    _run_pi_review "$DIFF_FILE" "$PROVIDER" "$MODEL" "$PERSONA" "$OUTFILE" "$ERRFILE"
+    return
+  fi
+
+  local FOCUS
+  FOCUS="$(_persona_focus "$PERSONA")"
+
+  local -a APPEND_ARGS=()
+  if [[ -n "$FOCUS" ]]; then
+    APPEND_ARGS=(--append-system-prompt "$FOCUS")
+  fi
+
+  # Per-instance agent dir avoids SQLite locking in parallel.
+  # Copy models config with restrictive permissions.
+  local INSTANCE_DIR OMP_HOME="${HOME}/.omp/agent"
+  INSTANCE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omp-review.XXXXXX")"
+  for f in models.json models.yml; do
+    if [[ -f "${OMP_HOME}/$f" ]]; then
+      cp "${OMP_HOME}/$f" "$INSTANCE_DIR/"
+      chmod 600 "$INSTANCE_DIR/$f"
+    fi
+  done
+
+  local PID
+  PI_CODING_AGENT_DIR="$INSTANCE_DIR" omp -p \
+    --model "${PROVIDER}/${MODEL}" \
+    --system-prompt "@${REVIEWER_PROMPT}" \
+    ${APPEND_ARGS[@]+"${APPEND_ARGS[@]}"} \
+    --no-tools \
+    --no-lsp --no-extensions --no-session --no-pty \
+    @"${DIFF_FILE}" \
+    "$REVIEW_PROMPT" \
+    > "$OUTFILE" 2> "$ERRFILE" &
+  PID=$!
+
+  local ELAPSED=0
+  while kill -0 "$PID" 2>/dev/null; do
+    if [[ "$ELAPSED" -ge "$PI_REVIEW_TIMEOUT" ]]; then
+      kill -- -"$PID" 2>/dev/null || kill "$PID" 2>/dev/null
+      wait "$PID" 2>/dev/null
+      echo "TIMEOUT: review exceeded ${PI_REVIEW_TIMEOUT}s" >> "$ERRFILE"
+      rm -rf "$INSTANCE_DIR"
+      return 1
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+  done
+
+  wait "$PID" 2>/dev/null
+  local RC=$?
+  rm -rf "$INSTANCE_DIR"
+  return $RC
+}
+
+_run_pi_review() {
+  local DIFF_FILE="$1" PROVIDER="$2" MODEL="$3" PERSONA="$4" OUTFILE="$5" ERRFILE="$6" REVIEW_PROMPT="${7:-Review this diff.}"
+  local PROMPT_FILE="${PI_PROMPTS_DIR}/${PERSONA}.md"
+
+  if [[ ! -f "$PROMPT_FILE" ]]; then
+    echo "Unknown persona: $PERSONA" > "$ERRFILE"
+    return 1
+  fi
+
+  # Per-instance agent dir for parallel safety (same pattern as omp)
+  local INSTANCE_DIR PI_HOME="${HOME}/.pi/agent"
+  INSTANCE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-review.XXXXXX")"
+  for f in models.json models.yml; do
+    if [[ -f "${PI_HOME}/$f" ]]; then
+      cp "${PI_HOME}/$f" "$INSTANCE_DIR/"
+      chmod 600 "$INSTANCE_DIR/$f"
+    fi
+  done
+
+  # Append review prompt to system prompt for context (diff vs full-file)
+  local COMBINED_PROMPT
+  COMBINED_PROMPT="$(mktemp "${INSTANCE_DIR}/prompt.XXXXXX")"
+  cat "$PROMPT_FILE" > "$COMBINED_PROMPT"
+  printf '\n\n%s\n' "$REVIEW_PROMPT" >> "$COMBINED_PROMPT"
+
+  local PID
+  PI_CODING_AGENT_DIR="$INSTANCE_DIR" pi -p \
+    --provider "$PROVIDER" --model "$MODEL" \
+    --system-prompt "@${COMBINED_PROMPT}" \
+    --no-tools \
+    < "$DIFF_FILE" \
+    > "$OUTFILE" 2> "$ERRFILE" &
+  PID=$!
+
+  local ELAPSED=0
+  while kill -0 "$PID" 2>/dev/null; do
+    if [[ "$ELAPSED" -ge "$PI_REVIEW_TIMEOUT" ]]; then
+      kill -- -"$PID" 2>/dev/null || kill "$PID" 2>/dev/null
+      wait "$PID" 2>/dev/null
+      echo "TIMEOUT: review exceeded ${PI_REVIEW_TIMEOUT}s" >> "$ERRFILE"
+      rm -rf "$INSTANCE_DIR"
+      return 1
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+  done
+
+  wait "$PID" 2>/dev/null
+  local RC=$?
+  rm -rf "$INSTANCE_DIR"
+  return $RC
+}
+
+# review_engine_info -- Print which engine will be used
+review_engine_info() {
+  if _has_omp; then
+    local VER
+    VER="$(omp --version 2>/dev/null | head -1)"
+    echo "omp (${VER:-unknown})"
+  else
+    local VER
+    VER="$(pi --version 2>/dev/null | head -1)"
+    echo "pi fallback (${VER:-unknown})"
+  fi
+}

@@ -1,0 +1,159 @@
+#!/bin/bash
+# pi-harness-common -- Shared boilerplate for all harness entry points
+# Source this AFTER pi-harness-config and pi-review-engine.
+# Provides: capture_diff, capture_files, setup_cleanup, track_pid
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  echo "ERROR: pi-harness-common must be sourced, not executed directly" >&2
+  exit 1
+fi
+
+# Max parallel reviewers (override with PI_MAX_PARALLEL)
+PI_MAX_PARALLEL="${PI_MAX_PARALLEL:-8}"
+
+# Max input size in lines (override with PI_MAX_INPUT_LINES)
+PI_MAX_INPUT_LINES="${PI_MAX_INPUT_LINES:-50000}"
+# Max input size in bytes (override with PI_MAX_INPUT_BYTES, default 10MB)
+PI_MAX_INPUT_BYTES="${PI_MAX_INPUT_BYTES:-10485760}"
+
+# Require at least one review engine
+_has_omp || command -v pi >/dev/null 2>&1 || {
+  echo "Error: neither 'omp' nor 'pi' found in PATH" >&2
+  exit 1
+}
+
+# Secrets patterns to reject in --files mode
+_SECRETS_PATTERN='\.(env|pem|key|p12|pfx|jks|keystore)$|credentials|\.secret|id_rsa|id_ed25519'
+
+# Kill all child processes on exit/interrupt
+_CHILD_PIDS=()
+_cleanup_children() {
+  for pid in ${_CHILD_PIDS[@]+"${_CHILD_PIDS[@]}"}; do
+    kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  done
+  wait 2>/dev/null
+}
+
+setup_cleanup() {
+  local OUTPUT_DIR="$1"
+  trap '_cleanup_children; rm -rf "'"$OUTPUT_DIR"'"' EXIT
+  trap '_cleanup_children; exit 130' INT TERM
+}
+
+# _check_size <file> <context>
+# Validates file size against line and byte limits. Prints error and returns 1 if exceeded.
+_check_size() {
+  local FILE="$1" CONTEXT="${2:-input}"
+
+  local BYTE_COUNT
+  BYTE_COUNT=$(wc -c < "$FILE" | tr -d ' ')
+  if [[ "$BYTE_COUNT" -gt "$PI_MAX_INPUT_BYTES" ]]; then
+    echo "Error: ${CONTEXT} too large (${BYTE_COUNT} bytes > PI_MAX_INPUT_BYTES=${PI_MAX_INPUT_BYTES})" >&2
+    return 1
+  fi
+
+  local LINE_COUNT
+  LINE_COUNT=$(wc -l < "$FILE" | tr -d ' ')
+  if [[ "$LINE_COUNT" -gt "$PI_MAX_INPUT_LINES" ]]; then
+    echo "Error: ${CONTEXT} too large (${LINE_COUNT} lines > PI_MAX_INPUT_LINES=${PI_MAX_INPUT_LINES})" >&2
+    return 1
+  fi
+}
+
+# capture_diff <output_file> <diff_cmd> <branch_mode> <default_branch>
+# Writes diff to output_file. Exits on failure or empty diff.
+capture_diff() {
+  local OUTPUT_FILE="$1"
+  local DIFF_CMD="$2"
+  local BRANCH_MODE="$3"
+  local DEFAULT_BRANCH="${4:-main}"
+
+  if [[ "$BRANCH_MODE" == "true" ]]; then
+    git diff "${DEFAULT_BRANCH}...HEAD" > "$OUTPUT_FILE" 2>/dev/null || {
+      echo "Error: git diff failed. Are you in a git repo?"
+      exit 1
+    }
+  else
+    sh -c "$DIFF_CMD" > "$OUTPUT_FILE" 2>/dev/null || {
+      echo "Error: diff command failed: $DIFF_CMD"
+      exit 1
+    }
+  fi
+
+  if [[ ! -s "$OUTPUT_FILE" ]]; then
+    echo "No diff to review."
+    exit 0
+  fi
+
+  _check_size "$OUTPUT_FILE" "diff" || exit 1
+}
+
+# _is_within_cwd <resolved_path>
+# Returns 0 if the resolved path is under the current working directory.
+_is_within_cwd() {
+  local RESOLVED="$1"
+  local CWD
+  CWD="$(pwd -P)/"
+  [[ "$RESOLVED" == "$CWD"* || "$RESOLVED" == "${CWD%/}" ]]
+}
+
+# capture_files <output_file> <files_glob>
+# Concatenates matching files with headers. Rejects symlinks, secrets, binaries,
+# and paths outside the current working directory.
+# Prints file count to stdout. Returns 1 if no files matched or size exceeded.
+capture_files() {
+  local OUTPUT_FILE="$1"
+  local FILES_GLOB="$2"
+  local FILE_COUNT=0
+  : > "$OUTPUT_FILE"
+
+  for f in $FILES_GLOB; do
+    [[ -f "$f" ]] || continue
+
+    local REAL_PATH
+    REAL_PATH="$(realpath "$f" 2>/dev/null || readlink -f "$f" 2>/dev/null || echo "$f")"
+
+    if [[ -L "$f" ]]; then
+      echo "WARN: skipping symlink: $f -> $REAL_PATH" >&2
+      continue
+    fi
+
+    if ! _is_within_cwd "$REAL_PATH"; then
+      echo "WARN: skipping file outside working directory: $f -> $REAL_PATH" >&2
+      continue
+    fi
+
+    if echo "$REAL_PATH" | grep -Eqi "$_SECRETS_PATTERN"; then
+      echo "WARN: skipping potential secret file: $f" >&2
+      continue
+    fi
+
+    local MIME
+    MIME="$(file -b --mime-type "$REAL_PATH" 2>/dev/null || echo "text/plain")"
+    case "$MIME" in
+      text/*|application/json|application/xml|application/javascript|application/x-yaml|application/toml) ;;
+      *)
+        echo "WARN: skipping binary file ($MIME): $f" >&2
+        continue
+        ;;
+    esac
+
+    printf '\n=== FILE: %s ===\n' "$f" >> "$OUTPUT_FILE"
+    cat -- "$REAL_PATH" >> "$OUTPUT_FILE"
+    FILE_COUNT=$((FILE_COUNT + 1))
+  done
+
+  if [[ "$FILE_COUNT" -eq 0 ]]; then
+    echo "No files match pattern: $FILES_GLOB" >&2
+    return 1
+  fi
+
+  _check_size "$OUTPUT_FILE" "file input" || return 1
+
+  echo "$FILE_COUNT"
+}
+
+# track_pid <pid>
+track_pid() {
+  _CHILD_PIDS+=("$1")
+}

@@ -1,0 +1,72 @@
+#!/bin/bash
+# pi-harness-config -- Shared configuration for pi-review, pi-verify, pi-swarm
+# Loaded by all harness scripts. Detects available providers and sets defaults.
+#
+# Override: set PI_HARNESS_MODELS env var or edit ~/.config/pi-harness/config
+
+_pi_harness_load_config() {
+  # User config takes priority
+  local CONFIG_FILE="${HOME}/.config/pi-harness/config"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+  else
+    # Auto-detect based on available API keys / provider configs
+    local HAS_LITELLM=false
+    local HAS_ANTHROPIC=false
+    local HAS_OPENAI=false
+
+    # LiteLLM: check if Pi has a litellm provider configured
+    if [[ -f "${HOME}/.pi/agent/models.json" ]] && grep -q '"litellm"' "${HOME}/.pi/agent/models.json" 2>/dev/null; then
+      HAS_LITELLM=true
+    fi
+
+    # Anthropic: direct API key
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+      HAS_ANTHROPIC=true
+    fi
+
+    # OpenAI: direct API key (Codex / Pro plan)
+    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+      HAS_OPENAI=true
+    fi
+
+    # Set defaults based on what's available
+    # Primary model (paid/quality): LiteLLM nocache > Anthropic direct > OpenAI
+    # Secondary model (free/cross-model): OpenAI > Anthropic > LiteLLM
+    if $HAS_LITELLM && $HAS_OPENAI; then
+      PI_HARNESS_MODEL_PRIMARY="${PI_HARNESS_MODEL_PRIMARY:-litellm/opus-nocache}"
+      PI_HARNESS_MODEL_SECONDARY="${PI_HARNESS_MODEL_SECONDARY:-openai/gpt-5.5}"
+    elif $HAS_ANTHROPIC && $HAS_OPENAI; then
+      PI_HARNESS_MODEL_PRIMARY="${PI_HARNESS_MODEL_PRIMARY:-anthropic/claude-opus-4-6}"
+      PI_HARNESS_MODEL_SECONDARY="${PI_HARNESS_MODEL_SECONDARY:-openai/gpt-5.5}"
+    elif $HAS_LITELLM; then
+      PI_HARNESS_MODEL_PRIMARY="${PI_HARNESS_MODEL_PRIMARY:-litellm/opus-nocache}"
+      PI_HARNESS_MODEL_SECONDARY="${PI_HARNESS_MODEL_SECONDARY:-litellm/pro-nocache}"
+    elif $HAS_ANTHROPIC; then
+      PI_HARNESS_MODEL_PRIMARY="${PI_HARNESS_MODEL_PRIMARY:-anthropic/claude-opus-4-6}"
+      PI_HARNESS_MODEL_SECONDARY="${PI_HARNESS_MODEL_SECONDARY:-anthropic/claude-sonnet-4-6}"
+    elif $HAS_OPENAI; then
+      PI_HARNESS_MODEL_PRIMARY="${PI_HARNESS_MODEL_PRIMARY:-openai/gpt-5.5}"
+      PI_HARNESS_MODEL_SECONDARY="${PI_HARNESS_MODEL_SECONDARY:-openai/gpt-5.3-codex}"
+    else
+      echo "Error: no API keys or LiteLLM config found." >&2
+      echo "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or configure LiteLLM in ~/.pi/agent/models.json" >&2
+      exit 1
+    fi
+
+    PI_HARNESS_MODELS="${PI_HARNESS_MODELS:-${PI_HARNESS_MODEL_PRIMARY},${PI_HARNESS_MODEL_SECONDARY}}"
+  fi
+
+  # Fix OPENAI_API_BASE conflict: if set, OpenAI calls get routed through LiteLLM
+  # instead of going direct. Unset it so --provider openai hits OpenAI directly.
+  # LiteLLM calls use the baseUrl from models.json, not this env var.
+  # Runs regardless of config source (user config or auto-detect).
+  if [[ -n "${OPENAI_API_BASE:-}" ]]; then
+    unset OPENAI_API_BASE
+  fi
+  if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+    unset OPENAI_BASE_URL
+  fi
+}
+
+_pi_harness_load_config

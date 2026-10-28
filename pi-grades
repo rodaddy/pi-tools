@@ -1,0 +1,170 @@
+#!/bin/bash
+# pi-grades -- Shared confidence grading for pi-verify and pi-swarm
+# Sources this file to get the grade_output() function
+#
+# Five-tier confidence: PERFECT > VERIFIED > PARTIAL > FEEDBACK > FAILED
+# "Absent proof = unsure, not verified" -- prevents false positives
+#
+# Handles both omp reviewer output (structured findings with P0-P3)
+# and pi fallback output (SEVERITY: CRITICAL/HIGH/MEDIUM/LOW + CLEAN signal)
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  echo "ERROR: pi-grades must be sourced, not executed directly" >&2
+  exit 1
+fi
+
+# _strip_codeblocks <file>
+# Output file content with fenced code blocks (```) removed.
+# Prevents grading from matching example/illustration text inside code blocks.
+_strip_codeblocks() {
+  awk '/^[[:space:]]{0,3}```/{skip=!skip; next} !skip{print}' "$1"
+}
+
+grade_output() {
+  local OUTFILE="$1"
+
+  if [[ ! -s "$OUTFILE" ]]; then
+    echo "FAILED"
+    return
+  fi
+
+  # Work on a stripped copy (no code blocks)
+  local STRIPPED
+  STRIPPED="$(mktemp)"
+  _strip_codeblocks "$OUTFILE" > "$STRIPPED"
+
+  local HAS_CLEAN=false
+  local HAS_BLOCKING=false
+  local HAS_NONBLOCKING=false
+
+  # --- Blocking signals (P0/critical/high) ---
+
+  # omp reviewer: P0 findings -- count P0 lines vs negation lines.
+  # Real findings survive even if the file also says "No P0 regressions".
+  # Find P0 lines that aren't negations (grep P0 lines, then exclude negation lines)
+  # Pipeline-safe: append `|| true` to prevent set -e/pipefail from aborting on empty grep
+  local P0_REAL
+  P0_REAL=$({ grep -Ei '(^[[:space:]#*|]*P0([^[:alnum:]]|$)|[|]P0[|])' "$STRIPPED" 2>/dev/null \
+    | grep -Eiv '(P0[[:space:]]*:?[[:space:]]*(None|0)|No[[:space:]]+P0|P0[[:space:]]*(issues|findings)?[[:space:]]*:?[[:space:]]*0)' \
+    | wc -l | tr -d ' '; } || true)
+  P0_REAL="${P0_REAL:-0}"
+  if [[ "$P0_REAL" -gt 0 ]]; then
+    HAS_BLOCKING=true
+  fi
+
+  # omp reviewer: negative verdict (scoped to verdict/overall lines)
+  if grep -Eqi '(Verdict|overall|correctness)[[:space:]]*:?[[:space:]].*(incorrect|not[[:space:]]+([[:alpha:]]+[[:space:]]+)*correct)' "$STRIPPED" 2>/dev/null; then
+    HAS_BLOCKING=true
+  fi
+
+  # pi fallback: SEVERITY: CRITICAL or HIGH
+  if grep -Eqi 'SEVERITY:[[:space:]]*(CRITICAL|HIGH)' "$STRIPPED" 2>/dev/null; then
+    HAS_BLOCKING=true
+  fi
+
+  # Shared: explicit merge-block signals
+  if grep -Eqi 'CONTRADICTED:|Do not merge' "$STRIPPED" 2>/dev/null; then
+    HAS_BLOCKING=true
+  fi
+
+  # omp reviewer: 🔴 emoji severity markers (excluding zero-count summary lines)
+  local RED_REAL
+  RED_REAL=$({ grep '🔴' "$STRIPPED" 2>/dev/null \
+    | grep -Eiv '(:[[:space:]]*(0|none)|[|][[:space:]]*0[[:space:]]*[|])' \
+    | wc -l | tr -d ' '; } || true)
+  RED_REAL="${RED_REAL:-0}"
+  if [[ "$RED_REAL" -gt 0 ]]; then
+    HAS_BLOCKING=true
+  fi
+
+  # omp reviewer: explicit merge-block headers
+  if grep -Eqi 'Fix[[:space:]]+Before[[:space:]]+Merge' "$STRIPPED" 2>/dev/null; then
+    HAS_BLOCKING=true
+  fi
+
+  # --- Non-blocking signals (P1-P3/medium/low) ---
+
+  # omp reviewer: P1, P2, P3 findings in structured positions, excluding negations
+  local PX_REAL
+  PX_REAL=$({ grep -Ei '(^[[:space:]#*|]*(P1|P2|P3)([^[:alnum:]]|$)|[|](P1|P2|P3)[|])' "$STRIPPED" 2>/dev/null \
+    | grep -Eiv '(P[1-3][[:space:]]*:?[[:space:]]*(None|0)|P[1-3].*:?[[:space:]]*None|No[[:space:]]+P[1-3]|P[1-3][[:space:]]*(issues|findings)?[[:space:]]*:?[[:space:]]*0)' \
+    | wc -l | tr -d ' '; } || true)
+  PX_REAL="${PX_REAL:-0}"
+  if [[ "$PX_REAL" -gt 0 ]]; then
+    HAS_NONBLOCKING=true
+  fi
+
+  # pi fallback: SEVERITY: MEDIUM or LOW
+  if grep -Eqi 'SEVERITY:[[:space:]]*(MEDIUM|LOW)' "$STRIPPED" 2>/dev/null; then
+    HAS_NONBLOCKING=true
+  fi
+
+  # omp reviewer: 🟡/🟢 emoji severity markers (excluding zero-count summary lines)
+  local YG_REAL
+  YG_REAL=$({ grep -E '(🟡|🟢)' "$STRIPPED" 2>/dev/null \
+    | grep -Eiv '(:[[:space:]]*(0|none)|[|][[:space:]]*0[[:space:]]*[|])' \
+    | wc -l | tr -d ' '; } || true)
+  YG_REAL="${YG_REAL:-0}"
+  if [[ "$YG_REAL" -gt 0 ]]; then
+    HAS_NONBLOCKING=true
+  fi
+
+  # --- Clean signals ---
+
+  # pi fallback: explicit CLEAN or ALL CLAIMS VERIFIED (line-anchored)
+  if grep -Eqi '^(CLEAN([[:space:]]--|$)|ALL CLAIMS VERIFIED)' "$STRIPPED" 2>/dev/null; then
+    HAS_CLEAN=true
+  fi
+
+  # omp reviewer: positive verdict -- match verdict/overall/correctness lines with "correct"
+  # without "incorrect" or "not correct" on the SAME line (scoped, not file-wide)
+  if grep -Eqi '(Verdict|overall|correctness)[[:space:]]*:?[[:space:]].*correct' "$STRIPPED" 2>/dev/null &&
+     ! grep -Eqi '(Verdict|overall|correctness)[[:space:]]*:?[[:space:]].*(incorrect|not[[:space:]]+([[:alpha:]]+[[:space:]]+)*correct)' "$STRIPPED" 2>/dev/null; then
+    HAS_CLEAN=true
+  fi
+  if grep -Eqi 'no bugs.*no blockers' "$STRIPPED" 2>/dev/null; then
+    HAS_CLEAN=true
+  fi
+
+  # omp reviewer: PASS verdict (anchored to avoid matching "password", "passing")
+  if grep -Eqi '(^|[|])[[:space:]]*PASS([[:space:]]|$)' "$STRIPPED" 2>/dev/null; then
+    HAS_CLEAN=true
+  fi
+
+  # omp reviewer: natural-language clean signals
+  if grep -Eqi 'No[[:space:]]+(blocking|significant|major)[[:space:]]|No[[:space:]]+action[[:space:]]+required|No[[:space:]]+(security|correctness)[[:space:]]+(issues|findings|bugs|concerns)' "$STRIPPED" 2>/dev/null; then
+    HAS_CLEAN=true
+  fi
+
+  rm -f "$STRIPPED"
+
+  # Grade assignment -- blocking always wins, then clean modifies non-blocking
+  if $HAS_BLOCKING; then
+    echo "FAILED"
+  elif $HAS_CLEAN && ! $HAS_NONBLOCKING; then
+    echo "PERFECT"
+  elif $HAS_CLEAN && $HAS_NONBLOCKING; then
+    echo "VERIFIED"
+  elif $HAS_NONBLOCKING; then
+    echo "FEEDBACK"
+  else
+    echo "PARTIAL"
+  fi
+}
+
+format_grade() {
+  local GRADE="$1"
+  case "$GRADE" in
+    PERFECT)  echo "PERFECT  -- all checks passed, no issues" ;;
+    VERIFIED) echo "VERIFIED -- clean with minor observations" ;;
+    PARTIAL)  echo "PARTIAL  -- some claims unverified, review needed" ;;
+    FEEDBACK) echo "FEEDBACK -- issues found, corrections needed" ;;
+    FAILED)   echo "FAILED   -- critical issues, do not merge" ;;
+    *)        echo "UNKNOWN  -- could not determine confidence" ;;
+  esac
+}
+
+grade_is_passing() {
+  local GRADE="$1"
+  [[ "$GRADE" == "PERFECT" || "$GRADE" == "VERIFIED" ]]
+}

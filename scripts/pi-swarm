@@ -1,0 +1,222 @@
+#!/bin/bash
+# pi-swarm -- Full parallel review swarm using omp (or Pi fallback)
+# Runs 4 personas across 2 models (8 total reviews) in parallel
+# Usage: pi-swarm [--diff-cmd "git diff ..."] [--models "litellm/opus-nocache,openai/gpt-5.5"]
+#        pi-swarm --branch          (review full branch diff vs main)
+#        pi-swarm --quick           (2 personas, 2 models = 4 reviews)
+#        pi-swarm --files "glob"    (review full file contents, not diffs)
+# Exit codes: 0 = pass, 1 = issues found, 2 = incomplete/infrastructure failure
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+if [[ -L "$0" ]]; then
+  REAL_PATH="$(readlink "$0" 2>/dev/null || true)"
+  [[ "$REAL_PATH" != /* ]] && REAL_PATH="$SCRIPT_DIR/$REAL_PATH"
+  SCRIPT_DIR="$(cd "$(dirname "$REAL_PATH")" && pwd -P)"
+fi
+
+PI_PROMPTS_DIR="$(cd "$SCRIPT_DIR/../prompts" && pwd -P)"
+export PI_PROMPTS_DIR
+
+source "$SCRIPT_DIR/../pi-harness-config"
+source "$SCRIPT_DIR/../pi-review-engine"
+source "$SCRIPT_DIR/../pi-grades"
+source "$SCRIPT_DIR/../pi-harness-common"
+
+DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)"
+DIFF_CMD="git diff HEAD"
+MODELS="${PI_HARNESS_MODELS}"
+PERSONAS="correctness,adversarial,security,quality"
+QUICK=false
+BRANCH_MODE=false
+FILES_GLOB=""
+INPUT_MODE="diff"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --diff-cmd) [[ $# -ge 2 ]] || { echo "Error: --diff-cmd requires a value"; exit 1; }; DIFF_CMD="$2"; shift 2 ;;
+    --diff-cmd=*) DIFF_CMD="${1#*=}"; shift ;;
+    --branch) BRANCH_MODE=true; shift ;;
+    --models) [[ $# -ge 2 ]] || { echo "Error: --models requires a value"; exit 1; }; MODELS="$2"; shift 2 ;;
+    --models=*) MODELS="${1#*=}"; shift ;;
+    --quick) QUICK=true; shift ;;
+    --files) [[ $# -ge 2 ]] || { echo "Error: --files requires a glob pattern"; exit 1; }; FILES_GLOB="$2"; INPUT_MODE="files"; shift 2 ;;
+    --files=*) FILES_GLOB="${1#*=}"; INPUT_MODE="files"; shift ;;
+    *) echo "Unknown arg: $1"; exit 1 ;;
+  esac
+done
+
+if $QUICK; then
+  PERSONAS="correctness,security"
+fi
+
+OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-swarm.XXXXXX")"
+setup_cleanup "$OUTPUT_DIR"
+
+INPUT_DESC=""
+
+if [[ "$INPUT_MODE" == "files" ]]; then
+  FILE_COUNT="$(capture_files "$OUTPUT_DIR/input.txt" "$FILES_GLOB")" || exit $?
+  INPUT_LINES=$(wc -l < "$OUTPUT_DIR/input.txt" | tr -d ' ')
+  INPUT_DESC="files: ${FILES_GLOB} (${FILE_COUNT} files, ${INPUT_LINES} lines)"
+  export PI_REVIEW_PROMPT="Review these files for issues. This is a full codebase review, not a diff review."
+else
+  capture_diff "$OUTPUT_DIR/input.txt" "$DIFF_CMD" "$BRANCH_MODE" "$DEFAULT_BRANCH"
+  INPUT_LINES=$(wc -l < "$OUTPUT_DIR/input.txt" | tr -d ' ')
+  if $BRANCH_MODE; then
+    INPUT_DESC="branch diff: ${DEFAULT_BRANCH}...HEAD (${INPUT_LINES} lines)"
+  else
+    INPUT_DESC="diff: ${DIFF_CMD} (${INPUT_LINES} lines)"
+  fi
+fi
+
+IFS=',' read -ra MODEL_LIST <<< "$MODELS"
+IFS=',' read -ra PERSONA_LIST <<< "$PERSONAS"
+
+# Enforce max parallelism
+TOTAL_JOBS=$(( ${#MODEL_LIST[@]} * ${#PERSONA_LIST[@]} ))
+if [[ "$TOTAL_JOBS" -gt "$PI_MAX_PARALLEL" ]]; then
+  echo "Error: ${TOTAL_JOBS} reviews exceeds PI_MAX_PARALLEL=${PI_MAX_PARALLEL}. Reduce --models or personas."
+  exit 1
+fi
+
+LAUNCHED=0
+PIDS=()
+PID_LABELS=()
+
+ENGINE="$(review_engine_info)"
+echo "=== pi-swarm ==="
+echo "Engine: ${ENGINE}"
+echo "Input: ${INPUT_DESC}"
+echo "Models: ${MODELS}"
+echo "Personas: ${PERSONAS}"
+
+for model_spec in "${MODEL_LIST[@]}"; do
+  model_spec="$(echo "$model_spec" | tr -d '[:space:]')"
+  [[ -z "$model_spec" ]] && continue
+  PROVIDER="${model_spec%%/*}"
+  MODEL="${model_spec#*/}"
+  SAFE_LABEL="${PROVIDER}_${MODEL}"
+  SAFE_LABEL="${SAFE_LABEL//\//_}"
+
+  for persona in "${PERSONA_LIST[@]}"; do
+    persona="$(echo "$persona" | tr -d '[:space:]')"
+    if ! _validate_persona "$persona"; then
+      echo "WARN: skipping unknown persona: ${persona}"
+      continue
+    fi
+
+    OUTFILE="$OUTPUT_DIR/${SAFE_LABEL}_${persona}.md"
+
+    run_review "$OUTPUT_DIR/input.txt" "$PROVIDER" "$MODEL" "$persona" \
+      "$OUTFILE" "$OUTFILE.err" &
+    PIDS+=($!)
+    track_pid $!
+    PID_LABELS+=("${PROVIDER}/${MODEL}/${persona}")
+    LAUNCHED=$((LAUNCHED + 1))
+  done
+done
+
+if [[ "$LAUNCHED" -eq 0 ]]; then
+  echo "Error: no reviewers launched. Check persona names and prompt files."
+  exit 1
+fi
+
+echo "Total reviews: ${LAUNCHED}"
+echo ""
+echo "Waiting for ${LAUNCHED} reviewers..."
+
+FAILURES=0
+for i in "${!PIDS[@]}"; do
+  if ! wait "${PIDS[$i]}" 2>/dev/null; then
+    echo "FAILED: ${PID_LABELS[$i]}"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+
+if [[ "$FAILURES" -gt 0 ]]; then
+  echo "$FAILURES reviewer(s) failed."
+fi
+echo "Review phase complete."
+echo ""
+
+GRADE_COUNTS_PERFECT=0
+GRADE_COUNTS_VERIFIED=0
+GRADE_COUNTS_PARTIAL=0
+GRADE_COUNTS_FEEDBACK=0
+GRADE_COUNTS_FAILED=0
+EMPTY=0
+REVIEWED=0
+
+for model_spec in "${MODEL_LIST[@]}"; do
+  model_spec="$(echo "$model_spec" | tr -d '[:space:]')"
+  [[ -z "$model_spec" ]] && continue
+  PROVIDER="${model_spec%%/*}"
+  MODEL="${model_spec#*/}"
+  SAFE_LABEL="${PROVIDER}_${MODEL}"
+  SAFE_LABEL="${SAFE_LABEL//\//_}"
+
+  for persona in "${PERSONA_LIST[@]}"; do
+    persona="$(echo "$persona" | tr -d '[:space:]')"
+    OUTFILE="$OUTPUT_DIR/${SAFE_LABEL}_${persona}.md"
+    if [[ ! -f "$OUTFILE" ]]; then continue; fi
+
+    echo "--- ${PROVIDER}/${MODEL} / ${persona} ---"
+
+    if [[ ! -s "$OUTFILE" ]]; then
+      echo "EMPTY OUTPUT (reviewer may have failed)"
+      [[ -s "$OUTFILE.err" ]] && cat "$OUTFILE.err"
+      EMPTY=$((EMPTY + 1))
+      echo ""
+      continue
+    fi
+
+    cat "$OUTFILE"
+    echo ""
+
+    GRADE="$(grade_output "$OUTFILE")"
+    echo "Grade: $(format_grade "$GRADE")"
+    echo ""
+
+    REVIEWED=$((REVIEWED + 1))
+    case "$GRADE" in
+      PERFECT)  GRADE_COUNTS_PERFECT=$((GRADE_COUNTS_PERFECT + 1)) ;;
+      VERIFIED) GRADE_COUNTS_VERIFIED=$((GRADE_COUNTS_VERIFIED + 1)) ;;
+      PARTIAL)  GRADE_COUNTS_PARTIAL=$((GRADE_COUNTS_PARTIAL + 1)) ;;
+      FEEDBACK) GRADE_COUNTS_FEEDBACK=$((GRADE_COUNTS_FEEDBACK + 1)) ;;
+      FAILED)   GRADE_COUNTS_FAILED=$((GRADE_COUNTS_FAILED + 1)) ;;
+    esac
+  done
+done
+
+PASSING=$((GRADE_COUNTS_PERFECT + GRADE_COUNTS_VERIFIED))
+
+echo "========================================="
+echo "=== SWARM SUMMARY ==="
+echo "Launched: ${LAUNCHED} | Failed: ${FAILURES} | Empty: ${EMPTY}"
+echo "Grades: PERFECT=${GRADE_COUNTS_PERFECT} VERIFIED=${GRADE_COUNTS_VERIFIED} PARTIAL=${GRADE_COUNTS_PARTIAL} FEEDBACK=${GRADE_COUNTS_FEEDBACK} FAILED=${GRADE_COUNTS_FAILED}"
+echo "Passing: ${PASSING}/${REVIEWED}"
+
+VERDICT_CODE=0
+if [[ "$REVIEWED" -eq 0 ]]; then
+  echo "=== VERDICT: INCOMPLETE -- no reviews completed ==="
+  VERDICT_CODE=2
+elif [[ "$FAILURES" -gt 0 || "$EMPTY" -gt 0 ]]; then
+  echo "=== VERDICT: INCOMPLETE -- ${FAILURES} failed, ${EMPTY} empty. Results unreliable. ==="
+  VERDICT_CODE=2
+elif [[ "$GRADE_COUNTS_FAILED" -gt 0 ]]; then
+  echo "=== VERDICT: FAILED -- ${GRADE_COUNTS_FAILED} reviewer(s) found critical issues ==="
+  VERDICT_CODE=1
+elif [[ "$GRADE_COUNTS_FEEDBACK" -gt 0 ]]; then
+  echo "=== VERDICT: FEEDBACK -- ${GRADE_COUNTS_FEEDBACK} reviewer(s) found issues needing correction ==="
+  VERDICT_CODE=1
+elif [[ "$PASSING" -eq "$REVIEWED" ]]; then
+  echo "=== VERDICT: CLEAN -- all reviewers passed ==="
+  VERDICT_CODE=0
+else
+  echo "=== VERDICT: PARTIAL -- ${GRADE_COUNTS_PARTIAL} reviewer(s) have unverified claims ==="
+  VERDICT_CODE=1
+fi
+echo "========================================="
+exit "$VERDICT_CODE"

@@ -1,0 +1,116 @@
+#!/bin/bash
+# pi-review -- Single cross-model code review using omp (or Pi fallback)
+# Usage: pi-review [persona] [--diff-cmd "git diff ..."] [--branch]
+# Personas: correctness, adversarial, security, quality, verifier
+# Runs the same diff through two models in parallel (auto-detected or configured)
+# Exit codes: 0 = pass, 1 = issues found, 2 = infrastructure failure
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+if [[ -L "$0" ]]; then
+  REAL_PATH="$(readlink "$0" 2>/dev/null || true)"
+  [[ "$REAL_PATH" != /* ]] && REAL_PATH="$SCRIPT_DIR/$REAL_PATH"
+  SCRIPT_DIR="$(cd "$(dirname "$REAL_PATH")" && pwd -P)"
+fi
+
+PI_PROMPTS_DIR="$(cd "$SCRIPT_DIR/../prompts" && pwd -P)"
+export PI_PROMPTS_DIR
+
+source "$SCRIPT_DIR/../pi-harness-config"
+source "$SCRIPT_DIR/../pi-review-engine"
+source "$SCRIPT_DIR/../pi-grades"
+source "$SCRIPT_DIR/../pi-harness-common"
+
+DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)"
+PERSONA="correctness"
+DIFF_CMD="git diff HEAD"
+BRANCH_MODE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --diff-cmd) [[ $# -ge 2 ]] || { echo "Error: --diff-cmd requires a value"; exit 1; }; DIFF_CMD="$2"; shift 2 ;;
+    --diff-cmd=*) DIFF_CMD="${1#*=}"; shift ;;
+    --branch) BRANCH_MODE=true; shift ;;
+    --*) echo "Unknown flag: $1"; exit 1 ;;
+    *) PERSONA="$1"; shift ;;
+  esac
+done
+
+if ! _validate_persona "$PERSONA"; then
+  echo "Unknown persona: $PERSONA"
+  echo "Available: $_VALID_PERSONAS"
+  exit 1
+fi
+
+OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-review.XXXXXX")"
+setup_cleanup "$OUTPUT_DIR"
+
+capture_diff "$OUTPUT_DIR/input.txt" "$DIFF_CMD" "$BRANCH_MODE" "$DEFAULT_BRANCH"
+
+PRIMARY_PROVIDER="${PI_HARNESS_MODEL_PRIMARY%%/*}"
+PRIMARY_MODEL="${PI_HARNESS_MODEL_PRIMARY#*/}"
+SECONDARY_PROVIDER="${PI_HARNESS_MODEL_SECONDARY%%/*}"
+SECONDARY_MODEL="${PI_HARNESS_MODEL_SECONDARY#*/}"
+
+ENGINE="$(review_engine_info)"
+if $BRANCH_MODE; then
+  INPUT_DESC="branch diff: ${DEFAULT_BRANCH}...HEAD"
+else
+  INPUT_DESC="diff: ${DIFF_CMD}"
+fi
+echo "=== pi-review: ${PERSONA} ==="
+echo "Engine: ${ENGINE}"
+echo "Models: ${PI_HARNESS_MODEL_PRIMARY} + ${PI_HARNESS_MODEL_SECONDARY}"
+echo "Input: ${INPUT_DESC}"
+echo ""
+
+run_review "$OUTPUT_DIR/input.txt" "$PRIMARY_PROVIDER" "$PRIMARY_MODEL" "$PERSONA" \
+  "$OUTPUT_DIR/primary.md" "$OUTPUT_DIR/primary.err" &
+PID_PRIMARY=$!
+track_pid $PID_PRIMARY
+
+run_review "$OUTPUT_DIR/input.txt" "$SECONDARY_PROVIDER" "$SECONDARY_MODEL" "$PERSONA" \
+  "$OUTPUT_DIR/secondary.md" "$OUTPUT_DIR/secondary.err" &
+PID_SECONDARY=$!
+track_pid $PID_SECONDARY
+
+STATUS_PRIMARY=0
+wait "$PID_PRIMARY" || STATUS_PRIMARY=$?
+STATUS_SECONDARY=0
+wait "$PID_SECONDARY" || STATUS_SECONDARY=$?
+
+echo "--- ${PI_HARNESS_MODEL_PRIMARY} ---"
+if [[ "$STATUS_PRIMARY" -ne 0 ]]; then
+  echo "REVIEWER FAILED (exit $STATUS_PRIMARY)"
+  [[ -s "$OUTPUT_DIR/primary.err" ]] && cat "$OUTPUT_DIR/primary.err"
+else
+  cat "$OUTPUT_DIR/primary.md"
+  GRADE_P="$(grade_output "$OUTPUT_DIR/primary.md")"
+  echo ""
+  echo "Grade: $(format_grade "$GRADE_P")"
+fi
+echo ""
+
+echo "--- ${PI_HARNESS_MODEL_SECONDARY} ---"
+if [[ "$STATUS_SECONDARY" -ne 0 ]]; then
+  echo "REVIEWER FAILED (exit $STATUS_SECONDARY)"
+  [[ -s "$OUTPUT_DIR/secondary.err" ]] && cat "$OUTPUT_DIR/secondary.err"
+else
+  cat "$OUTPUT_DIR/secondary.md"
+  GRADE_S="$(grade_output "$OUTPUT_DIR/secondary.md")"
+  echo ""
+  echo "Grade: $(format_grade "$GRADE_S")"
+fi
+echo ""
+
+if [[ "$STATUS_PRIMARY" -ne 0 || "$STATUS_SECONDARY" -ne 0 ]]; then
+  echo "=== WARNING: One or more reviewers failed ==="
+  exit 2
+fi
+
+if grade_is_passing "${GRADE_P:-PARTIAL}" && grade_is_passing "${GRADE_S:-PARTIAL}"; then
+  exit 0
+else
+  exit 1
+fi

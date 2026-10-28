@@ -1,0 +1,134 @@
+#!/bin/bash
+# pi-verify -- Independent post-build verification using omp (or Pi fallback)
+# Runs verifier prompt against two models for cross-model validation
+# Usage: pi-verify [--diff-cmd "git diff ..."] [--description "what this change does"]
+#        pi-verify --branch           (verify full branch diff vs main)
+# Exit codes: 0 = verified, 1 = issues found, 2 = infrastructure failure
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+if [[ -L "$0" ]]; then
+  REAL_PATH="$(readlink "$0" 2>/dev/null || true)"
+  [[ "$REAL_PATH" != /* ]] && REAL_PATH="$SCRIPT_DIR/$REAL_PATH"
+  SCRIPT_DIR="$(cd "$(dirname "$REAL_PATH")" && pwd -P)"
+fi
+
+PI_PROMPTS_DIR="$(cd "$SCRIPT_DIR/../prompts" && pwd -P)"
+export PI_PROMPTS_DIR
+
+source "$SCRIPT_DIR/../pi-harness-config"
+source "$SCRIPT_DIR/../pi-review-engine"
+source "$SCRIPT_DIR/../pi-grades"
+source "$SCRIPT_DIR/../pi-harness-common"
+
+DEFAULT_BRANCH="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)"
+DIFF_CMD="git diff HEAD"
+DESCRIPTION=""
+BRANCH_MODE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --diff-cmd) [[ $# -ge 2 ]] || { echo "Error: --diff-cmd requires a value"; exit 1; }; DIFF_CMD="$2"; shift 2 ;;
+    --diff-cmd=*) DIFF_CMD="${1#*=}"; shift ;;
+    --description) [[ $# -ge 2 ]] || { echo "Error: --description requires a value"; exit 1; }; DESCRIPTION="$2"; shift 2 ;;
+    --description=*) DESCRIPTION="${1#*=}"; shift ;;
+    --branch) BRANCH_MODE=true; shift ;;
+    *) echo "Unknown arg: $1"; exit 1 ;;
+  esac
+done
+
+OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-verify.XXXXXX")"
+setup_cleanup "$OUTPUT_DIR"
+
+capture_diff "$OUTPUT_DIR/diff-raw.txt" "$DIFF_CMD" "$BRANCH_MODE" "$DEFAULT_BRANCH"
+
+# Prepend description with clear delimiter if provided
+if [[ -n "$DESCRIPTION" ]]; then
+  {
+    printf '=== AUTHOR DESCRIPTION (context only, verify independently) ===\n'
+    printf '%s\n' "$DESCRIPTION"
+    printf '=== END DESCRIPTION ===\n\n=== DIFF TO VERIFY ===\n'
+    cat "$OUTPUT_DIR/diff-raw.txt"
+  } > "$OUTPUT_DIR/input.txt"
+else
+  cp "$OUTPUT_DIR/diff-raw.txt" "$OUTPUT_DIR/input.txt"
+fi
+
+# Verifier uses secondary as primary (different model family from builder)
+PRIMARY_PROVIDER="${PI_HARNESS_MODEL_SECONDARY%%/*}"
+PRIMARY_MODEL="${PI_HARNESS_MODEL_SECONDARY#*/}"
+SECONDARY_PROVIDER="${PI_HARNESS_MODEL_PRIMARY%%/*}"
+SECONDARY_MODEL="${PI_HARNESS_MODEL_PRIMARY#*/}"
+
+ENGINE="$(review_engine_info)"
+if $BRANCH_MODE; then
+  INPUT_DESC="branch diff: ${DEFAULT_BRANCH}...HEAD"
+else
+  INPUT_DESC="diff: ${DIFF_CMD}"
+fi
+echo "=== pi-verify: independent verification ==="
+echo "Engine: ${ENGINE}"
+echo "Models: ${PI_HARNESS_MODEL_SECONDARY} (primary) + ${PI_HARNESS_MODEL_PRIMARY} (secondary)"
+echo "Input: ${INPUT_DESC}"
+[[ -n "$DESCRIPTION" ]] && echo "Description: ${DESCRIPTION}"
+echo ""
+
+run_review "$OUTPUT_DIR/input.txt" "$PRIMARY_PROVIDER" "$PRIMARY_MODEL" "verifier" \
+  "$OUTPUT_DIR/primary-verify.md" "$OUTPUT_DIR/primary.err" &
+PID_PRIMARY=$!
+track_pid $PID_PRIMARY
+
+run_review "$OUTPUT_DIR/input.txt" "$SECONDARY_PROVIDER" "$SECONDARY_MODEL" "verifier" \
+  "$OUTPUT_DIR/secondary-verify.md" "$OUTPUT_DIR/secondary.err" &
+PID_SECONDARY=$!
+track_pid $PID_SECONDARY
+
+STATUS_PRIMARY=0
+wait "$PID_PRIMARY" || STATUS_PRIMARY=$?
+STATUS_SECONDARY=0
+wait "$PID_SECONDARY" || STATUS_SECONDARY=$?
+
+FAILED=0
+
+echo "--- ${PI_HARNESS_MODEL_SECONDARY} Verification ---"
+if [[ "$STATUS_PRIMARY" -ne 0 ]]; then
+  echo "REVIEWER FAILED (exit $STATUS_PRIMARY)"
+  [[ -s "$OUTPUT_DIR/primary.err" ]] && cat "$OUTPUT_DIR/primary.err"
+  FAILED=$((FAILED + 1))
+else
+  cat "$OUTPUT_DIR/primary-verify.md"
+  GRADE_P="$(grade_output "$OUTPUT_DIR/primary-verify.md")"
+  echo ""
+  echo "Grade: $(format_grade "$GRADE_P")"
+fi
+echo ""
+
+echo "--- ${PI_HARNESS_MODEL_PRIMARY} Verification ---"
+if [[ "$STATUS_SECONDARY" -ne 0 ]]; then
+  echo "REVIEWER FAILED (exit $STATUS_SECONDARY)"
+  [[ -s "$OUTPUT_DIR/secondary.err" ]] && cat "$OUTPUT_DIR/secondary.err"
+  FAILED=$((FAILED + 1))
+else
+  cat "$OUTPUT_DIR/secondary-verify.md"
+  GRADE_S="$(grade_output "$OUTPUT_DIR/secondary-verify.md")"
+  echo ""
+  echo "Grade: $(format_grade "$GRADE_S")"
+fi
+echo ""
+
+if [[ "$FAILED" -gt 0 ]]; then
+  echo "=== RESULT: INCOMPLETE -- $FAILED reviewer(s) failed ==="
+  exit 2
+fi
+
+if grade_is_passing "${GRADE_P:-PARTIAL}" && grade_is_passing "${GRADE_S:-PARTIAL}"; then
+  echo "=== RESULT: VERIFIED by both models ==="
+  exit 0
+elif grade_is_passing "${GRADE_P:-PARTIAL}" || grade_is_passing "${GRADE_S:-PARTIAL}"; then
+  echo "=== RESULT: PARTIAL -- one model found issues, review above ==="
+  exit 1
+else
+  echo "=== RESULT: ISSUES FOUND by both models -- fix before shipping ==="
+  exit 1
+fi
